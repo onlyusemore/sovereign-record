@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you reference this work, please cite it as below."
+authors:
+  - family-names: "onlyusemore"
+title: "Post-hoc Rationalization in Clinical AI Audit Logs: A Record Structure That Makes Substitution Detectable"
+version: 1.0.0
+date-released: 2026-09-29
+url: "https://github.com/onlyusemore/sovereign-record"
+license: MIT
