@@ -2,14 +2,16 @@
 immutability, monotonic sequencing."""
 from __future__ import annotations
 
+import argparse
 import hashlib
 import hmac
 import json
 import os
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, Mapping, Optional
 
 
 class LedgerError(Exception): pass
@@ -112,7 +114,12 @@ class Ledger:
         self._next_seq += 1
         return signed
 
-    def verify(self) -> None:
+    def verify(self, external_anchor: Optional[Mapping[str, object]] = None) -> None:
+        """Verify the chain and, if supplied, an independently retained snapshot.
+
+        An external anchor is an exact checkpoint: later legitimate appends also
+        require a newer snapshot (or verification of the earlier prefix).
+        """
         prev = GENESIS_CHAIN
         for i, rec in enumerate(self._records):
             if rec.seq != i:
@@ -124,6 +131,29 @@ class Ledger:
             prev = chain_hash(prev, canonical_bytes(rec.payload_for_signing()))
         if self._storage is not None:
             self._verify_anchor(len(self._records), prev)
+        if external_anchor is not None:
+            if not isinstance(external_anchor, Mapping):
+                raise VerificationError("external anchor must be an object")
+            count = external_anchor.get("count")
+            head = external_anchor.get("chain")
+            if (type(count) is not int or count < 0 or not isinstance(head, str)
+                    or len(head) != 64 or any(c not in "0123456789abcdef" for c in head)):
+                raise VerificationError("invalid external anchor")
+            if count != len(self._records):
+                raise SequenceError(
+                    f"external anchor count {count} != loaded length {len(self._records)}"
+                )
+            if not hmac.compare_digest(head, prev.hex()):
+                raise VerificationError("external anchor chain head does not match ledger")
+
+    def export_anchor(self) -> dict:
+        """Return a verified, portable {count, chain} checkpoint.
+
+        The caller must store it outside the ledger writer's control. Exporting
+        alone provides no protection against coordinated rollback.
+        """
+        self.verify()
+        return {"count": len(self._records), "chain": self._last_chain.hex()}
 
     def _sign(self, rec: Record) -> str:
         msg = canonical_bytes(rec.payload_for_signing())
@@ -224,3 +254,49 @@ class Ledger:
             )
         if anchor["chain"] != chain.hex():
             raise VerificationError("anchor chain head does not match ledger")
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    """Auditor commands; the HMAC key is supplied out of band, never in argv."""
+    parser = argparse.ArgumentParser(description="Verify or export a sovereign-record ledger")
+    commands = parser.add_subparsers(dest="command", required=True)
+    verify_cmd = commands.add_parser("verify", help="verify a ledger on disk")
+    verify_cmd.add_argument("directory", type=Path)
+    verify_cmd.add_argument("--external-anchor", type=Path, metavar="FILE",
+                            help="trusted checkpoint JSON held outside the ledger")
+    export_cmd = commands.add_parser("export-anchor", help="print a verified checkpoint as JSON")
+    export_cmd.add_argument("directory", type=Path)
+    args = parser.parse_args(argv)
+
+    key_hex = os.environ.get("SOVEREIGN_RECORD_KEY_HEX", "")
+    try:
+        key = bytes.fromhex(key_hex)
+    except ValueError:
+        key = b""
+    if len(key) < 32:
+        parser.error("set SOVEREIGN_RECORD_KEY_HEX to a secret key of at least 32 bytes (hex)")
+
+    directory = args.directory
+    if not directory.is_dir() or not (directory / "records.jsonl").is_file():
+        print("verification failed: directory must contain records.jsonl", file=sys.stderr)
+        return 1
+    try:
+        ledger = Ledger(key, storage_path=directory)
+        if args.command == "verify":
+            external = None
+            if args.external_anchor is not None:
+                external = json.loads(args.external_anchor.read_text(encoding="utf-8"))
+                if not isinstance(external, dict):
+                    raise VerificationError("external anchor must be an object")
+            ledger.verify(external_anchor=external)
+            print("verified")
+        else:
+            print(json.dumps(ledger.export_anchor(), sort_keys=True))
+    except (LedgerError, OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"verification failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -32,6 +34,34 @@ def test_happy_path_and_reload():
         led.append("tok-B", "recommend: 10mg")
         led.verify()
         Ledger(key, storage_path=base / "ledger").verify()
+        env = {**os.environ, "SOVEREIGN_RECORD_KEY_HEX": key.hex()}
+        script = Path(__file__).with_name("sovereign_record.py")
+        cmd = [sys.executable, str(script)]
+        result = subprocess.run(cmd + ["verify", str(base / "ledger")],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "verified"
+        exported = subprocess.run(cmd + ["export-anchor", str(base / "ledger")],
+                                  env=env, capture_output=True, text=True)
+        assert exported.returncode == 0, exported.stderr
+        anchor = base / "independent-checkpoint.json"
+        anchor.write_text(exported.stdout)
+        result = subprocess.run(cmd + ["verify", str(base / "ledger"),
+                                       "--external-anchor", str(anchor)],
+                                env=env, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert subprocess.run(cmd + ["verify", str(base / "missing")],
+                              env=env, capture_output=True).returncode == 1
+        assert subprocess.run(cmd + ["verify", str(base / "ledger")],
+                              env={**env, "SOVEREIGN_RECORD_KEY_HEX": os.urandom(32).hex()},
+                              capture_output=True).returncode == 1
+        assert subprocess.run(cmd + ["verify", str(base / "ledger")],
+                              env={**env, "SOVEREIGN_RECORD_KEY_HEX": ""},
+                              capture_output=True).returncode == 2
+        anchor.write_text("null")  # An explicit anchor must never be ignored.
+        assert subprocess.run(cmd + ["verify", str(base / "ledger"),
+                                     "--external-anchor", str(anchor)],
+                              env=env, capture_output=True).returncode == 1
 
 
 def test_attack_tamper():
@@ -99,3 +129,43 @@ def test_attack_insert():
         _write_lines(records, lines)
         with pytest.raises((SequenceError, VerificationError)):
             Ledger(key, storage_path=base / "ledger")
+
+
+def test_attack_coordinated_rollback():
+    key = os.urandom(32)
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        led = _make_ledger(base, key)
+        led.append("tok-0", "out-0")
+        records = base / "ledger" / "records.jsonl"
+        local_anchor = base / "ledger" / "anchor.json"
+        old_records = records.read_bytes()
+        old_anchor = local_anchor.read_bytes()
+        led.append("tok-1", "out-1")
+        led.append("tok-2", "out-2")
+        external = led.export_anchor()
+        assert external["count"] == 3
+
+        # Attacker controls both local files, but not the independently held copy.
+        records.write_bytes(old_records)
+        local_anchor.write_bytes(old_anchor)
+        rolled_back = Ledger(key, storage_path=base / "ledger")
+        rolled_back.verify()  # Without external evidence, the attack succeeds.
+        with pytest.raises(SequenceError):
+            rolled_back.verify(external_anchor=external)
+        with pytest.raises(VerificationError):
+            rolled_back.verify(external_anchor={"count": 1, "chain": external["chain"]})
+        with pytest.raises(VerificationError):
+            rolled_back.verify(external_anchor={"count": 1, "chain": "é" * 64})
+
+        independent = base / "checkpoint.json"
+        independent.write_text(json.dumps(external))
+        script = Path(__file__).with_name("sovereign_record.py")
+        result = subprocess.run(
+            [sys.executable, str(script), "verify", str(base / "ledger"),
+             "--external-anchor", str(independent)],
+            env={**os.environ, "SOVEREIGN_RECORD_KEY_HEX": key.hex()},
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1
+        assert "external anchor count" in result.stderr

@@ -8,7 +8,7 @@
 
 ## Abstract
 
-Clinical AI systems increasingly log decisions for audit. When a clinician asks why a recommendation was made, many systems generate an explanation after the fact, from a different process than the one that produced the decision. These post-hoc explanations are ingested into audit logs as if they were causal records. They pass audit because audit checks that logs exist and are internally consistent, not that they were written at the time of the decision. We describe this failure mode and propose a record structure in which reasoning is captured at inference or explicitly marked absent. Records are signed, chained, and monotonically sequenced; substitution is detectable, and absence is a first-class signed state. We state the boundary of the claim plainly: the ledger proves what was signed, not that the signer was truthful. We provide a reference implementation with five adversarial tests, and a threat model covering tampering, truncation, reordering, and insertion, and we enumerate what the structure does not protect against.
+Clinical AI systems increasingly log decisions for audit. When a clinician asks why a recommendation was made, many systems generate an explanation after the fact, from a different process than the one that produced the decision. These post-hoc explanations are ingested into audit logs as if they were causal records. They pass audit because audit checks that logs exist and are internally consistent, not that they were written at the time of the decision. We describe this failure mode and propose a record structure in which reasoning is captured at inference or explicitly marked absent. Records are signed, chained, and monotonically sequenced; substitution is detectable, and absence is a first-class signed state. We state the boundary of the claim plainly: the ledger proves what was signed, not that the signer was truthful. We provide a reference implementation with six tests (including coordinated rollback against an external checkpoint), and a threat model covering tampering, truncation, reordering, and insertion, and we enumerate what the structure does not protect against.
 
 **Keywords:** provenance, auditability, clinical AI, post-hoc explanation, cryptographic logging
 
@@ -87,7 +87,7 @@ Records carry a gap-free sequence starting at 0. The anchor stores the expected 
 
 ### 3.4 Reference implementation
 
-The reference implementation is approximately 220 lines of Python, using only the standard library (`hmac`, `hashlib`, `json`, `os`, `time`, `pathlib`, `dataclasses`, `typing`). It includes a file-backed store with `fsync` on record append and atomic `os.replace` on the anchor, followed by a parent-directory `fsync` to make the rename durable.
+The reference implementation is a single Python file, using only the standard library. It includes a file-backed store with `fsync` on record append and atomic `os.replace` on the anchor, followed by a parent-directory `fsync` to make the rename durable.
 
 The full source is available at https://github.com/onlyusemore/sovereign-record under the MIT License. See Section 3.5 for the full reproducibility record.
 
@@ -95,17 +95,18 @@ The full source is available at https://github.com/onlyusemore/sovereign-record 
 
 The reference implementation and its adversarial test suite are publicly available at https://github.com/onlyusemore/sovereign-record.
 
-The implementation is a single file, `sovereign_record.py`, comprising approximately 220 lines of Python, using only the standard library. It was executed and verified on Python 3.13.
+The implementation is a single standard-library Python file, `sovereign_record.py`. CI runs the test suite on Python 3.10–3.13.
 
-The adversarial test suite, `test_adversarial.py`, comprises five tests. Each test constructs a ledger, applies a specific attack, and asserts that the attack is detected:
+The test suite, `test_adversarial.py`, comprises six tests. The coordinated rollback test deliberately shows that local verification passes, then checks that an independently retained checkpoint detects the rollback:
 
 - `test_happy_path_and_reload` — verifies a pristine ledger across a reload
 - `test_attack_tamper` — modifies a field after signing
 - `test_attack_truncate` — removes the last record
 - `test_attack_reorder` — swaps two records
 - `test_attack_insert` — inserts a forged record in the middle
+- `test_attack_coordinated_rollback` — restores both local files to an earlier state and checks against a newer external checkpoint
 
-All five tests pass in 0.04 seconds on the reference environment. The test suite was independently cloned and executed by a third party outside the author's environment; the result was identical (`5 passed`).
+The original five-test suite was independently cloned and executed by a third party (`5 passed`). The updated six-test suite can be reproduced using the command below and is also run in CI.
 
 To reproduce:
 
@@ -141,7 +142,7 @@ The structure is designed to detect the following:
 The structure does not protect against:
 
 - **Key compromise.** An attacker with the HMAC key can forge any record. The key must be held in a KMS or HSM, not in the writer's process memory.
-- **Coordinated rollback.** An attacker who can rewrite both the record file and the anchor to a prior consistent state can produce a ledger that verifies. The only defense is external anchoring: publishing the chain head to an append-only log outside the writer's control.
+- **Coordinated rollback without an external checkpoint.** An attacker who can rewrite both the record file and the local anchor to a prior consistent state can produce a ledger that verifies locally. `export_anchor()` returns a count and chain head that an operator can retain independently; `verify(external_anchor=...)` rejects a different current state. Export alone is not sufficient: the checkpoint must be retained outside the attacker's control. The API compares exact states, not historical prefixes.
 - **Crash between record fsync and anchor replace.** On reload, the count will exceed the anchor and the ledger fails closed. Recovery is a human decision; the code does not guess.
 - **Signer dishonesty.** A writer with the key can sign `ABSENT` when reasoning existed, or sign a fabricated rationale as `PRESENT`. The ledger proves what was signed. It does not prove that the signer was truthful at signing time.
 - **Wall clock skew.** `monotonic_ns` is the ordering primitive. `wall_time_s` is informational and signed, so tampering is detectable, but it is not trustworthy for ordering.
@@ -162,9 +163,9 @@ The contribution of this paper is not to resolve that incentive. It is to make t
 
 **The signer is not verified.** The ledger proves what was signed, not that the signer was honest. A writer with the key can lie. This is the fundamental boundary of the contribution.
 
-**No independent security audit.** The implementation has been tested against the four attacks enumerated in Section 3.5. It has not been reviewed by a professional cryptographer. The use of HMAC-SHA256 and SHA-256 follows standard practice, but this is not a substitute for expert review. Production deployment should be preceded by such review.
+**No independent security audit.** The implementation has been tested against the attacks enumerated in Section 3.5. It has not been reviewed by a professional cryptographer. The use of HMAC-SHA256 and SHA-256 follows standard practice, but this is not a substitute for expert review. Production deployment should be preceded by such review.
 
-**External anchoring is required for full rollback protection.** The structure described here detects tail truncation and rollback only against an anchor the writer controls. To defeat coordinated rollback, the anchor's chain head must be published to an append-only external log on a schedule. This is not implemented in the reference code.
+**External anchoring is required for full rollback protection.** Local verification alone cannot detect coordinated rollback. The reference code exports a checkpoint and compares it during verification, but does not publish it or implement an independent append-only service. An operator must preserve a trusted, current checkpoint outside the writer's control; this API checks an exact snapshot, so later legitimate appends require a newer checkpoint for full-ledger verification.
 
 **Key management is out of scope.** The reference implementation holds the key in process memory. Production use requires a KMS or HSM.
 
