@@ -13,6 +13,17 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Literal, Mapping, Optional
 
+try:
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey, Ed25519PublicKey,
+    )
+    from cryptography.hazmat.primitives.serialization import (
+        Encoding, PublicFormat,
+    )
+    _HAS_ED25519 = True
+except ImportError:
+    _HAS_ED25519 = False
+
 
 class LedgerError(Exception): pass
 class VerificationError(LedgerError): pass
@@ -66,6 +77,7 @@ class Record:
             "prev_chain": self.prev_chain,
         }
 
+
     def __post_init__(self) -> None:
         if not isinstance(self.reasoning_state, str):
             raise TypeError("reasoning_state must be a string")
@@ -80,15 +92,97 @@ class Record:
                 raise TypeError(f"reasoning entries must be Step; got {type(item).__name__}")
 
 
-class Ledger:
-    def __init__(
-        self, key: bytes, *, storage_path: Optional[Path] = None,
-        time_fn: Callable[[], int] = time.monotonic_ns,
-        wall_fn: Callable[[], float] = time.time,
-    ) -> None:
+class HmacSigner:
+    """Symmetric signer: the writer and the verifier share the same key."""
+
+    def __init__(self, key: bytes) -> None:
         if len(key) < 32:
             raise ValueError("HMAC key must be at least 32 bytes")
         self._key = key
+
+    def sign(self, msg: bytes) -> str:
+        return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+
+    def verify(self, msg: bytes, sig: str) -> bool:
+        return hmac.compare_digest(self.sign(msg), sig)
+
+
+class Ed25519Signer:
+    """Asymmetric signer: the writer holds the private key, anyone holding
+    the public key can verify, and nobody else can append."""
+
+    def __init__(
+        self, *, private_key=None, public_key=None,
+    ) -> None:
+        if not _HAS_ED25519:
+            raise RuntimeError(
+                "the 'cryptography' package is required for Ed25519 support"
+            )
+        if private_key is None and public_key is None:
+            raise ValueError("provide a private key or a public key")
+        if private_key is not None and public_key is not None:
+            raise ValueError("provide a private key or a public key, not both")
+        self._private = private_key
+        self._public = public_key or private_key.public_key()
+
+    @classmethod
+    def generate(cls) -> "Ed25519Signer":
+        if not _HAS_ED25519:
+            raise RuntimeError(
+                "the 'cryptography' package is required for Ed25519 support"
+            )
+        return cls(private_key=Ed25519PrivateKey.generate())
+
+    @classmethod
+    def from_private_hex(cls, hex_key: str) -> "Ed25519Signer":
+        if not _HAS_ED25519:
+            raise RuntimeError(
+                "the 'cryptography' package is required for Ed25519 support"
+            )
+        return cls(private_key=Ed25519PrivateKey.from_private_bytes(bytes.fromhex(hex_key)))
+
+    @classmethod
+    def from_public_hex(cls, hex_key: str) -> "Ed25519Signer":
+        if not _HAS_ED25519:
+            raise RuntimeError(
+                "the 'cryptography' package is required for Ed25519 support"
+            )
+        return cls(public_key=Ed25519PublicKey.from_public_bytes(bytes.fromhex(hex_key)))
+
+    def public_key_hex(self) -> str:
+        return self._public.public_bytes(
+            Encoding.Raw, PublicFormat.Raw,
+        ).hex()
+
+    def sign(self, msg: bytes) -> str:
+        if self._private is None:
+            raise TypeError(
+                "verify-only signer: appending requires the private key"
+            )
+        return self._private.sign(msg).hex()
+
+    def verify(self, msg: bytes, sig: str) -> bool:
+        try:
+            self._public.verify(bytes.fromhex(sig), msg)
+            return True
+        except Exception:
+            return False
+
+
+class Ledger:
+    def __init__(
+        self, key: Optional[bytes] = None, *, signer: Optional[object] = None,
+        storage_path: Optional[Path] = None,
+        time_fn: Callable[[], int] = time.monotonic_ns,
+        wall_fn: Callable[[], float] = time.time,
+    ) -> None:
+        if signer is None:
+            if key is None:
+                raise ValueError("provide an HMAC key or a signer")
+            signer = HmacSigner(key)
+        elif key is not None:
+            raise ValueError("pass either key or signer, not both")
+        self._signer = signer
         self._time_fn = time_fn
         self._wall_fn = wall_fn
         self._storage = Path(storage_path) if storage_path else None
@@ -131,7 +225,7 @@ class Ledger:
                 raise SequenceError(f"expected seq {i}, got {rec.seq}")
             if rec.prev_chain != prev.hex():
                 raise VerificationError(f"chain break at seq {i}")
-            if not hmac.compare_digest(self._sign(rec), rec.signature):
+            if not self._signer.verify(canonical_bytes(rec.payload_for_signing()), rec.signature):
                 raise VerificationError(f"signature mismatch at seq {i}")
             if last_mono is not None and rec.monotonic_ns < last_mono:
                 raise SequenceError(
@@ -168,7 +262,7 @@ class Ledger:
 
     def _sign(self, rec: Record) -> str:
         msg = canonical_bytes(rec.payload_for_signing())
-        return hmac.new(self._key, msg, hashlib.sha256).hexdigest()
+        return self._signer.sign(msg)
 
     @staticmethod
     def _replace_signature(rec: Record, sig: str) -> Record:
@@ -211,7 +305,7 @@ class Ledger:
                 raise SequenceError(f"on-disk seq {rec.seq} at position {i}")
             if rec.prev_chain != prev.hex():
                 raise VerificationError(f"on-disk chain break at seq {i}")
-            if not hmac.compare_digest(self._sign(rec), rec.signature):
+            if not self._signer.verify(canonical_bytes(rec.payload_for_signing()), rec.signature):
                 raise VerificationError(f"on-disk signature mismatch at seq {i}")
             if last_mono is not None and rec.monotonic_ns < last_mono:
                 raise SequenceError(
@@ -286,20 +380,25 @@ def main(argv: Optional[list[str]] = None) -> int:
     export_cmd.add_argument("directory", type=Path)
     args = parser.parse_args(argv)
 
+    public_hex = os.environ.get("SOVEREIGN_RECORD_PUBLIC_KEY_HEX", "")
     key_hex = os.environ.get("SOVEREIGN_RECORD_KEY_HEX", "")
-    try:
-        key = bytes.fromhex(key_hex)
-    except ValueError:
-        key = b""
-    if len(key) < 32:
-        parser.error("set SOVEREIGN_RECORD_KEY_HEX to a secret key of at least 32 bytes (hex)")
+    if public_hex:
+        signer = Ed25519Signer.from_public_hex(public_hex)
+    else:
+        try:
+            key = bytes.fromhex(key_hex)
+        except ValueError:
+            key = b""
+        if len(key) < 32:
+            parser.error("set SOVEREIGN_RECORD_KEY_HEX to a secret key of at least 32 bytes (hex), or SOVEREIGN_RECORD_PUBLIC_KEY_HEX to an Ed25519 public key")
+        signer = HmacSigner(key)
 
     directory = args.directory
     if not directory.is_dir() or not (directory / "records.jsonl").is_file():
         print("verification failed: directory must contain records.jsonl", file=sys.stderr)
         return 1
     try:
-        ledger = Ledger(key, storage_path=directory)
+        ledger = Ledger(signer=signer, storage_path=directory)
         if args.command == "verify":
             external = None
             if args.external_anchor is not None:
