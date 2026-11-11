@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sovereign-record"
+version = "2.0.0"
+description = "Signed, append-only record ledger that binds AI reasoning to decisions at inference time"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE"}
+authors = [{name = "onlyusemore"}]
+keywords = ["audit", "provenance", "ai-safety", "logging", "cryptography", "ed25519", "hmac"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Logging",
+]
+dependencies = []
+
+[project.optional-dependencies]
+ed25519 = ["cryptography>=42"]
+test = ["pytest", "cryptography>=42"]
+
+[project.scripts]
+sovereign-record = "sovereign_record:main"
+
+[tool.setuptools]
+py-modules = ["sovereign_record"]
