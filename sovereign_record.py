@@ -67,6 +67,10 @@ class Record:
         }
 
     def __post_init__(self) -> None:
+        if not isinstance(self.reasoning_state, str):
+            raise TypeError("reasoning_state must be a string")
+        if self.reasoning_state not in ("PRESENT", "ABSENT"):
+            raise ValueError("reasoning_state must be PRESENT or ABSENT")
         if self.reasoning_state == "ABSENT" and self.reasoning:
             raise ValueError("ABSENT record must have empty reasoning")
         if self.reasoning_state == "PRESENT" and not self.reasoning:
