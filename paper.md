@@ -8,7 +8,7 @@
 
 ## Abstract
 
-Clinical AI systems increasingly log decisions for audit. When a clinician asks why a recommendation was made, many systems generate an explanation after the fact, from a different process than the one that produced the decision. These post-hoc explanations are ingested into audit logs as if they were causal records. They pass audit because audit checks that logs exist and are internally consistent, not that they were written at the time of the decision. We describe this failure mode and propose a record structure in which reasoning is captured at inference or explicitly marked absent. Records are signed, chained, and monotonically sequenced; substitution is detectable, and absence is a first-class signed state. We state the boundary of the claim plainly: the ledger proves what was signed, not that the signer was truthful. We provide a reference implementation with a 32-test adversarial suite (covering tampering, truncation, reordering, insertion, reasoning-state validation, backdated monotonic time, coordinated rollback against an external checkpoint, and Ed25519 asymmetric signature verification), and we enumerate what the structure does not protect against.
+Clinical AI systems increasingly log decisions for audit. When a clinician asks why a recommendation was made, many systems generate an explanation after the fact, from a different process than the one that produced the decision. These post-hoc explanations are ingested into audit logs as if they were causal records. They pass audit because audit checks that logs exist and are internally consistent, not that they were written at the time of the decision. We describe this failure mode and propose a record structure in which reasoning is captured at inference or explicitly marked absent. Records are signed, chained, and monotonically sequenced; substitution is detectable, and absence is a first-class signed state. We state the boundary of the claim plainly: the ledger proves what was signed, not that the signer was truthful. We provide a reference implementation with a 39-test adversarial suite (covering tampering, truncation, reordering, insertion, reasoning-state validation, backdated monotonic time, coordinated rollback against an external checkpoint, Ed25519 asymmetric signature verification, and the CLI lifecycle), and we enumerate what the structure does not protect against.
 
 **Keywords:** provenance, auditability, clinical AI, post-hoc explanation, cryptographic logging
 
@@ -42,7 +42,7 @@ Sigstore provides signing and transparency for software artifacts. It binds an i
 
 Certificate Transparency (RFC 6962) and transparency logs more generally provide append-only, tamper-evident records. They are the right primitive for the chain structure proposed here, but the logs do not, by themselves, constrain what is written into them. A system that writes post-hoc rationales into a transparency log produces a tamper-evident record of a substituted explanation.
 
-Work on chain-of-thought faithfulness has established that a model's stated reasoning may not reflect its internal computation. This paper is adjacent but distinct: the concern here is not whether the reasoning is faithful to the model's internals, but whether the record presented as reasoning was written at the time of the decision at all.
+Work on chain-of-thought faithfulness has established that a model's stated reasoning may not reflect its internal computation. Recent measurements sharpen this finding: models produce unfaithful chain-of-thought on natural prompts, including post-hoc justifications for contradictory answers (Arcuschin et al., 2026); explanation faithfulness can be measured with counterfactual input modifications (Matton et al., 2025); and many existing faithfulness tests in fact measure output-level self-consistency rather than faithfulness to inner workings (Parcalabescu and Frank, 2024). These results support the premise that stated reasoning cannot be taken at face value. They do not establish how often substitution occurs in deployed clinical systems; this paper's contribution is structural — making substitution detectable — not an empirical incidence rate. The concern here is also narrower than faithfulness: it is whether the record presented as reasoning was written at the time of the decision at all.
 
 Clinical AI audit requirements under the FDA's guidance and the EU AI Act require that decisions be logged and explainable. They do not, as written, require that the explanation be contemporaneous with the decision. A system that generates explanations post-hoc can meet the letter of these requirements while violating their intent.
 
@@ -99,14 +99,15 @@ The reference implementation and its adversarial test suite are publicly availab
 
 The implementation is a single Python file, `sovereign_record.py`. CI runs the full test suite on Python 3.10–3.13.
 
-The suite comprises 32 tests across four files:
+The suite comprises 39 tests across five files:
 
 - `test_adversarial.py` (6) — the original chain attacks: happy path and reload, tamper, truncate, reorder, insert, and coordinated rollback. The rollback test deliberately shows that local verification passes, then checks that an independently retained checkpoint detects the rollback.
 - `test_reasoning_state.py` (10) — `reasoning_state` must be a string equal to `PRESENT` or `ABSENT`; non-string values raise `TypeError`, unknown strings raise `ValueError`, and the existing state/content invariants still hold.
 - `test_monotonic_ns.py` (6) — time may not go backwards: `append()` refuses to persist such a record, and verification and reload reject correctly signed but backdated sequences.
 - `test_ed25519.py` (10) — asymmetric signing: valid signatures verify with the public key alone, verify-only signers cannot append, and forged signatures, wrong public keys, and tampered on-disk records are rejected; both CLI verification paths are exercised.
+- `test_cli.py` (7) — the command-line lifecycle: key generation for both schemes, ledger initialization, full Ed25519 append and public-key verification cycles, the HMAC writer path, refusal of public-only signers to append, and JSON failure reporting.
 
-The original five-test suite was independently cloned and executed by a third party (`5 passed`). The current 32-test suite can be reproduced using the command below and is also run in CI.
+The original five-test suite was independently cloned and executed by a third party (`5 passed`). The current 39-test suite can be reproduced using the command below and is also run in CI.
 
 To reproduce:
 
@@ -196,5 +197,8 @@ Post-hoc rationalization passes clinical audit because audit checks consistency,
 - RFC 6962, Certificate Transparency
 - Sigstore, Software Signing and Transparency
 - Wei et al., Chain-of-Thought Prompting Elicits Reasoning in Large Language Models, NeurIPS 2022
+- Arcuschin et al., Chain-of-Thought Reasoning In The Wild Is Not Always Faithful, ICML 2026
+- Matton et al., Walk the Talk? Measuring the Faithfulness of Large Language Model Explanations, ICLR 2025
+- Parcalabescu and Frank, On Measuring Faithfulness or Self-consistency of Natural Language Explanations, ACL 2024
 - FDA, Marketing Submission Recommendations for AI-Enabled Device Software Functions
 - EU AI Act, Regulation (EU) 2024/1689
