@@ -8,7 +8,7 @@
 
 ## Abstract
 
-Clinical AI systems increasingly log decisions for audit. When a clinician asks why a recommendation was made, many systems generate an explanation after the fact, from a different process than the one that produced the decision. These post-hoc explanations are ingested into audit logs as if they were causal records. They pass audit because audit checks that logs exist and are internally consistent, not that they were written at the time of the decision. We describe this failure mode and propose a record structure in which reasoning is captured at inference or explicitly marked absent. Records are signed, chained, and monotonically sequenced; substitution is detectable, and absence is a first-class signed state. We state the boundary of the claim plainly: the ledger proves what was signed, not that the signer was truthful. We provide a reference implementation with six tests (including coordinated rollback against an external checkpoint), and a threat model covering tampering, truncation, reordering, and insertion, and we enumerate what the structure does not protect against.
+Clinical AI systems increasingly log decisions for audit. When a clinician asks why a recommendation was made, many systems generate an explanation after the fact, from a different process than the one that produced the decision. These post-hoc explanations are ingested into audit logs as if they were causal records. They pass audit because audit checks that logs exist and are internally consistent, not that they were written at the time of the decision. We describe this failure mode and propose a record structure in which reasoning is captured at inference or explicitly marked absent. Records are signed, chained, and monotonically sequenced; substitution is detectable, and absence is a first-class signed state. We state the boundary of the claim plainly: the ledger proves what was signed, not that the signer was truthful. We provide a reference implementation with a 32-test adversarial suite (covering tampering, truncation, reordering, insertion, reasoning-state validation, backdated monotonic time, coordinated rollback against an external checkpoint, and Ed25519 asymmetric signature verification), and we enumerate what the structure does not protect against.
 
 **Keywords:** provenance, auditability, clinical AI, post-hoc explanation, cryptographic logging
 
@@ -66,13 +66,13 @@ A record is written at the time of the decision. Its fields include:
 - `monotonic_ns`: the writer's monotonic clock reading at write time
 - `wall_time_s`: an informational timestamp, signed but not trusted for ordering
 - `prev_chain`: the previous record's chain head
-- `signature`: an HMAC over the canonical payload
+- `signature`: an HMAC-SHA256 or Ed25519 signature over the canonical payload
 
 The invariant is enforced at construction: a `PRESENT` record must contain at least one step; an `ABSENT` record must contain none. `ABSENT` is a signed assertion that no reasoning was available. It is not a missing field. It is not an error. It is a first-class state that the writer cannot later replace with a fabricated rationale without breaking the signature.
 
 ### 3.2 Chain immutability
 
-Each record's HMAC covers a chain hash over the previous record's canonical payload:
+Each record's signature (HMAC-SHA256 or Ed25519) covers a chain hash over the previous record's canonical payload:
 
 ```
 chain_0 = SHA256(0x00 * 32 || canonical(record_0))
@@ -85,9 +85,11 @@ The chain head is stored separately and atomically. On reload, every signature i
 
 Records carry a gap-free sequence starting at 0. The anchor stores the expected count and chain head. If the record file is truncated or rolled back without also rewriting the anchor consistently, reload fails closed. The failure is deliberate: a tail truncation and a crashed append are indistinguishable from the record file alone, so the system refuses to guess and requires human intervention.
 
+Monotonic time is ordered, not merely recorded: `append()` refuses to create a record whose `monotonic_ns` is older than its predecessor's, and both in-memory verification and on-disk reload reject any backdated sequence — including records that are otherwise correctly signed and chained.
+
 ### 3.4 Reference implementation
 
-The reference implementation is a single Python file, using only the standard library. It includes a file-backed store with `fsync` on record append and atomic `os.replace` on the anchor, followed by a parent-directory `fsync` to make the rename durable.
+The reference implementation is a single Python file. HMAC-SHA256 operation uses only the standard library; the optional Ed25519 mode requires the `cryptography` package. It includes a file-backed store with `fsync` on record append and atomic `os.replace` on the anchor, followed by a parent-directory `fsync` to make the rename durable.
 
 The full source is available at https://github.com/onlyusemore/sovereign-record under the MIT License. See Section 3.5 for the full reproducibility record.
 
@@ -95,34 +97,33 @@ The full source is available at https://github.com/onlyusemore/sovereign-record 
 
 The reference implementation and its adversarial test suite are publicly available at https://github.com/onlyusemore/sovereign-record.
 
-The implementation is a single standard-library Python file, `sovereign_record.py`. CI runs the test suite on Python 3.10–3.13.
+The implementation is a single Python file, `sovereign_record.py`. CI runs the full test suite on Python 3.10–3.13.
 
-The test suite, `test_adversarial.py`, comprises six tests. The coordinated rollback test deliberately shows that local verification passes, then checks that an independently retained checkpoint detects the rollback:
+The suite comprises 32 tests across four files:
 
-- `test_happy_path_and_reload` — verifies a pristine ledger across a reload
-- `test_attack_tamper` — modifies a field after signing
-- `test_attack_truncate` — removes the last record
-- `test_attack_reorder` — swaps two records
-- `test_attack_insert` — inserts a forged record in the middle
-- `test_attack_coordinated_rollback` — restores both local files to an earlier state and checks against a newer external checkpoint
+- `test_adversarial.py` (6) — the original chain attacks: happy path and reload, tamper, truncate, reorder, insert, and coordinated rollback. The rollback test deliberately shows that local verification passes, then checks that an independently retained checkpoint detects the rollback.
+- `test_reasoning_state.py` (10) — `reasoning_state` must be a string equal to `PRESENT` or `ABSENT`; non-string values raise `TypeError`, unknown strings raise `ValueError`, and the existing state/content invariants still hold.
+- `test_monotonic_ns.py` (6) — time may not go backwards: `append()` refuses to persist such a record, and verification and reload reject correctly signed but backdated sequences.
+- `test_ed25519.py` (10) — asymmetric signing: valid signatures verify with the public key alone, verify-only signers cannot append, and forged signatures, wrong public keys, and tampered on-disk records are rejected; both CLI verification paths are exercised.
 
-The original five-test suite was independently cloned and executed by a third party (`5 passed`). The updated six-test suite can be reproduced using the command below and is also run in CI.
+The original five-test suite was independently cloned and executed by a third party (`5 passed`). The current 32-test suite can be reproduced using the command below and is also run in CI.
 
 To reproduce:
 
 ```
 git clone https://github.com/onlyusemore/sovereign-record
 cd sovereign-record
-pip install pytest
-python -m pytest test_adversarial.py -v
+pip install pytest cryptography
+python -m pytest -q
 ```
 
 The cryptographic primitives are fixed and explicit:
 
 - Chain hash: SHA-256 over `prev_chain || canonical(record)`
-- Record signature: HMAC-SHA256 over `canonical(record)`
+- Record signature: HMAC-SHA256 (symmetric, default) or Ed25519 (asymmetric, optional) over `canonical(record)`
 - Canonical form: JSON with `sort_keys=True`, `separators=(",", ":")`, `ensure_ascii=False`
-- Key length: minimum 32 bytes, enforced at construction
+- Symmetric key length: minimum 32 bytes, enforced at construction
+- Ed25519: writer holds the private key; any holder of the 32-byte public key can verify but cannot append
 
 The ledger fails closed on any detected inconsistency. A malformed line in the record file, a signature mismatch, a chain break, or an anchor count mismatch all raise typed exceptions (`PersistenceError`, `VerificationError`, `SequenceError`), and the ledger refuses to load. The system does not attempt to repair or guess.
 
@@ -141,7 +142,7 @@ The structure is designed to detect the following:
 
 The structure does not protect against:
 
-- **Key compromise.** An attacker with the HMAC key can forge any record. The key must be held in a KMS or HSM, not in the writer's process memory.
+- **Key compromise.** An attacker with the HMAC key can forge any record. The key must be held in a KMS or HSM, not in the writer's process memory. Ed25519 narrows but does not remove this exposure: the private key still forges records, while the public key only verifies.
 - **Coordinated rollback without an external checkpoint.** An attacker who can rewrite both the record file and the local anchor to a prior consistent state can produce a ledger that verifies locally. `export_anchor()` returns a count and chain head that an operator can retain independently; `verify(external_anchor=...)` rejects a different current state. Export alone is not sufficient: the checkpoint must be retained outside the attacker's control. The API compares exact states, not historical prefixes.
 - **Crash between record fsync and anchor replace.** On reload, the count will exceed the anchor and the ledger fails closed. Recovery is a human decision; the code does not guess.
 - **Signer dishonesty.** A writer with the key can sign `ABSENT` when reasoning existed, or sign a fabricated rationale as `PRESENT`. The ledger proves what was signed. It does not prove that the signer was truthful at signing time.
@@ -163,7 +164,7 @@ The contribution of this paper is not to resolve that incentive. It is to make t
 
 **The signer is not verified.** The ledger proves what was signed, not that the signer was honest. A writer with the key can lie. This is the fundamental boundary of the contribution.
 
-**No independent security audit.** The implementation has been tested against the attacks enumerated in Section 3.5. It has not been reviewed by a professional cryptographer. The use of HMAC-SHA256 and SHA-256 follows standard practice, but this is not a substitute for expert review. Production deployment should be preceded by such review.
+**No independent security audit.** The implementation has been tested against the attacks enumerated in Section 3.5. It has not been reviewed by a professional cryptographer. The use of HMAC-SHA256, SHA-256, and Ed25519 follows standard practice and well-studied primitives, but this is not a substitute for expert review. Production deployment should be preceded by such review.
 
 **External anchoring is required for full rollback protection.** Local verification alone cannot detect coordinated rollback. The reference code exports a checkpoint and compares it during verification, but does not publish it or implement an independent append-only service. An operator must preserve a trusted, current checkpoint outside the writer's control; this API checks an exact snapshot, so later legitimate appends require a newer checkpoint for full-ledger verification.
 
