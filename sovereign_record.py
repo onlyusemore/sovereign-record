@@ -108,6 +108,11 @@ class Ledger:
             wall_time_s=float(self._wall_fn()),
             prev_chain=self._last_chain.hex(), signature="",
         )
+        if self._records and unsigned.monotonic_ns < self._records[-1].monotonic_ns:
+            raise SequenceError(
+                f"refusing to append: monotonic_ns went backwards "
+                f"({unsigned.monotonic_ns} < {self._records[-1].monotonic_ns})"
+            )
         signed = self._replace_signature(unsigned, self._sign(unsigned))
         if self._storage is not None:
             self._persist(signed)
