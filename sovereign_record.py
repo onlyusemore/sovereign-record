@@ -18,7 +18,7 @@ try:
         Ed25519PrivateKey, Ed25519PublicKey,
     )
     from cryptography.hazmat.primitives.serialization import (
-        Encoding, PublicFormat,
+        Encoding, PublicFormat, PrivateFormat, NoEncryption,
     )
     _HAS_ED25519 = True
 except ImportError:
@@ -152,6 +152,13 @@ class Ed25519Signer:
     def public_key_hex(self) -> str:
         return self._public.public_bytes(
             Encoding.Raw, PublicFormat.Raw,
+        ).hex()
+
+    def private_key_hex(self) -> str:
+        if self._private is None:
+            raise TypeError("verify-only signer has no private key")
+        return self._private.private_bytes(
+            Encoding.Raw, PrivateFormat.Raw, NoEncryption(),
         ).hex()
 
     def sign(self, msg: bytes) -> str:
@@ -373,36 +380,133 @@ class Ledger:
             raise VerificationError("anchor chain head does not match ledger")
 
 
+def _signer_from_env(parser) -> object:
+    """Build a signer from environment variables, never from argv.
+
+    Precedence: Ed25519 private key (writer), Ed25519 public key
+    (verify-only), then the HMAC secret key (writer and verifier).
+    """
+    private_hex = os.environ.get("SOVEREIGN_RECORD_PRIVATE_KEY_HEX", "")
+    public_hex = os.environ.get("SOVEREIGN_RECORD_PUBLIC_KEY_HEX", "")
+    key_hex = os.environ.get("SOVEREIGN_RECORD_KEY_HEX", "")
+    if private_hex:
+        try:
+            return Ed25519Signer.from_private_hex(private_hex)
+        except Exception as exc:
+            parser.error(f"invalid SOVEREIGN_RECORD_PRIVATE_KEY_HEX: {exc}")
+    if public_hex:
+        try:
+            return Ed25519Signer.from_public_hex(public_hex)
+        except Exception as exc:
+            parser.error(f"invalid SOVEREIGN_RECORD_PUBLIC_KEY_HEX: {exc}")
+    try:
+        key = bytes.fromhex(key_hex)
+    except ValueError:
+        key = b""
+    if len(key) >= 32:
+        return HmacSigner(key)
+    return None
+
+
+def _load_reasoning(path: Optional[Path]) -> Optional[list]:
+    if path is None:
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, list):
+        raise ValueError("--reasoning file must contain a JSON list of {source, content} steps")
+    return [Step(source=s["source"], content=s["content"]) for s in data]
+
+
 def main(argv: Optional[list[str]] = None) -> int:
-    """Auditor commands; the HMAC key is supplied out of band, never in argv."""
-    parser = argparse.ArgumentParser(description="Verify or export a sovereign-record ledger")
+    """Ledger commands; signing keys are supplied out of band, never in argv."""
+    parser = argparse.ArgumentParser(
+        prog="sovereign-record",
+        description="Signed, append-only record ledger with chain immutability",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
+
+    keygen_cmd = commands.add_parser(
+        "keygen", help="generate signing key material and print it as hex")
+    keygen_cmd.add_argument("--scheme", choices=["ed25519", "hmac"], default="ed25519",
+                            help="signing scheme (default: ed25519)")
+
+    init_cmd = commands.add_parser("init", help="create an empty ledger directory")
+    init_cmd.add_argument("directory", type=Path)
+
+    append_cmd = commands.add_parser("append", help="append a record (requires a writer key)")
+    append_cmd.add_argument("directory", type=Path)
+    append_cmd.add_argument("token", help="identifier for the decision context")
+    append_cmd.add_argument("output", help="the decision or recommendation")
+    append_cmd.add_argument("--reasoning", type=Path, metavar="FILE",
+                            help="JSON file with a list of {source, content} steps")
+    append_cmd.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
     verify_cmd = commands.add_parser("verify", help="verify a ledger on disk")
     verify_cmd.add_argument("directory", type=Path)
     verify_cmd.add_argument("--external-anchor", type=Path, metavar="FILE",
                             help="trusted checkpoint JSON held outside the ledger")
+    verify_cmd.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+
     export_cmd = commands.add_parser("export-anchor", help="print a verified checkpoint as JSON")
     export_cmd.add_argument("directory", type=Path)
     args = parser.parse_args(argv)
 
-    public_hex = os.environ.get("SOVEREIGN_RECORD_PUBLIC_KEY_HEX", "")
-    key_hex = os.environ.get("SOVEREIGN_RECORD_KEY_HEX", "")
-    if public_hex:
-        signer = Ed25519Signer.from_public_hex(public_hex)
-    else:
-        try:
-            key = bytes.fromhex(key_hex)
-        except ValueError:
-            key = b""
-        if len(key) < 32:
-            parser.error("set SOVEREIGN_RECORD_KEY_HEX to a secret key of at least 32 bytes (hex), or SOVEREIGN_RECORD_PUBLIC_KEY_HEX to an Ed25519 public key")
-        signer = HmacSigner(key)
+    if args.command == "keygen":
+        if args.scheme == "hmac":
+            print(os.urandom(32).hex())
+            return 0
+        if not _HAS_ED25519:
+            print("keygen: the 'cryptography' package is required for Ed25519", file=sys.stderr)
+            return 1
+        signer = Ed25519Signer.generate()
+        print(json.dumps({
+            "scheme": "ed25519",
+            "private_key_hex": signer.private_key_hex(),
+            "public_key_hex": signer.public_key_hex(),
+        }, indent=2))
+        return 0
+
+    if args.command == "init":
+        args.directory.mkdir(parents=True, exist_ok=True)
+        records_file = args.directory / "records.jsonl"
+        if not records_file.exists():
+            records_file.touch()
+        print(f"initialized empty ledger at {args.directory}")
+        return 0
+
+    signer = _signer_from_env(parser)
 
     directory = args.directory
     if not directory.is_dir() or not (directory / "records.jsonl").is_file():
         print("verification failed: directory must contain records.jsonl", file=sys.stderr)
         return 1
     try:
+        if args.command == "append":
+            if signer is None:
+                parser.error("append requires SOVEREIGN_RECORD_PRIVATE_KEY_HEX (Ed25519 writer) or SOVEREIGN_RECORD_KEY_HEX (HMAC writer)")
+            try:
+                signer.sign(b"")
+            except TypeError:
+                parser.error("append requires a private key: a public-only signer cannot write")
+            ledger = Ledger(signer=signer, storage_path=directory)
+            rec = ledger.append(
+                args.token, args.output,
+                reasoning=_load_reasoning(args.reasoning),
+            )
+            if args.json:
+                print(json.dumps({
+                    "status": "appended",
+                    "seq": rec.seq,
+                    "reasoning_state": rec.reasoning_state,
+                    "monotonic_ns": rec.monotonic_ns,
+                    "signature": rec.signature,
+                }, sort_keys=True))
+            else:
+                print(f"appended seq={rec.seq} reasoning_state={rec.reasoning_state}")
+            return 0
+
+        if signer is None:
+            parser.error("set SOVEREIGN_RECORD_KEY_HEX (HMAC) or SOVEREIGN_RECORD_PUBLIC_KEY_HEX / SOVEREIGN_RECORD_PRIVATE_KEY_HEX (Ed25519)")
         ledger = Ledger(signer=signer, storage_path=directory)
         if args.command == "verify":
             external = None
@@ -411,11 +515,21 @@ def main(argv: Optional[list[str]] = None) -> int:
                 if not isinstance(external, dict):
                     raise VerificationError("external anchor must be an object")
             ledger.verify(external_anchor=external)
-            print("verified")
+            if args.json:
+                print(json.dumps({
+                    "status": "verified",
+                    **ledger.export_anchor(),
+                }, sort_keys=True))
+            else:
+                print("verified")
         else:
             print(json.dumps(ledger.export_anchor(), sort_keys=True))
     except (LedgerError, OSError, ValueError, TypeError, KeyError) as exc:
-        print(f"verification failed: {exc}", file=sys.stderr)
+        message = f"verification failed: {exc}" if args.command != "append" else f"append failed: {exc}"
+        if getattr(args, "json", False):
+            print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
+        else:
+            print(message, file=sys.stderr)
         return 1
     return 0
 
