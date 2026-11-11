@@ -125,6 +125,7 @@ class Ledger:
         require a newer snapshot (or verification of the earlier prefix).
         """
         prev = GENESIS_CHAIN
+        last_mono: Optional[int] = None
         for i, rec in enumerate(self._records):
             if rec.seq != i:
                 raise SequenceError(f"expected seq {i}, got {rec.seq}")
@@ -132,6 +133,12 @@ class Ledger:
                 raise VerificationError(f"chain break at seq {i}")
             if not hmac.compare_digest(self._sign(rec), rec.signature):
                 raise VerificationError(f"signature mismatch at seq {i}")
+            if last_mono is not None and rec.monotonic_ns < last_mono:
+                raise SequenceError(
+                    f"monotonic_ns went backwards at seq {i}: "
+                    f"{rec.monotonic_ns} < {last_mono}"
+                )
+            last_mono = rec.monotonic_ns
             prev = chain_hash(prev, canonical_bytes(rec.payload_for_signing()))
         if self._storage is not None:
             self._verify_anchor(len(self._records), prev)
@@ -198,6 +205,7 @@ class Ledger:
                     prev_chain=obj["prev_chain"], signature=obj["signature"],
                 ))
         prev = GENESIS_CHAIN
+        last_mono: Optional[int] = None
         for i, rec in enumerate(loaded):
             if rec.seq != i:
                 raise SequenceError(f"on-disk seq {rec.seq} at position {i}")
@@ -205,6 +213,12 @@ class Ledger:
                 raise VerificationError(f"on-disk chain break at seq {i}")
             if not hmac.compare_digest(self._sign(rec), rec.signature):
                 raise VerificationError(f"on-disk signature mismatch at seq {i}")
+            if last_mono is not None and rec.monotonic_ns < last_mono:
+                raise SequenceError(
+                    f"on-disk monotonic_ns went backwards at seq {i}: "
+                    f"{rec.monotonic_ns} < {last_mono}"
+                )
+            last_mono = rec.monotonic_ns
             prev = chain_hash(prev, canonical_bytes(rec.payload_for_signing()))
         self._verify_anchor(len(loaded), prev)
         self._records = loaded
